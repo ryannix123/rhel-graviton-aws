@@ -39,6 +39,7 @@ Create a file named `rhel-graviton-policy.json` with the following content:
                 "ec2:CreateSecurityGroup",
                 "ec2:AuthorizeSecurityGroupIngress",
                 "ec2:RevokeSecurityGroupIngress",
+                "ec2:ModifyVpcAttribute",
                 "ec2:DescribeVpcAttribute",
                 "ec2:CreateVpc",
                 "ec2:DeleteVpc",
@@ -59,9 +60,7 @@ Create a file named `rhel-graviton-policy.json` with the following content:
             "Condition": {
                 "StringEquals": {
                     "ec2:Region": [
-                        "us-east-2a", 
-                        "us-east-2b", 
-                        "us-east-2c"
+                        "us-east-2"
                     ]
                 }
             }
@@ -73,10 +72,40 @@ Create a file named `rhel-graviton-policy.json` with the following content:
             ],
             "Resource": "arn:aws:ec2:*:*:instance/*",
             "Condition": {
-                "StringEquals": {
-                    "ec2:InstanceType": "t4g.small"
+                "StringLike": {
+                    "ec2:InstanceType": "t4g.*"
                 }
             }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:RunInstances"
+            ],
+            "Resource": [
+                "arn:aws:ec2:*:*:subnet/*",
+                "arn:aws:ec2:*:*:network-interface/*",
+                "arn:aws:ec2:*:*:instance/*",
+                "arn:aws:ec2:*:*:volume/*",
+                "arn:aws:ec2:*:*:security-group/*",
+                "arn:aws:ec2:*:*:key-pair/*",
+                "arn:aws:ec2:*::image/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreatePolicy",
+                "iam:DeletePolicy",
+                "iam:CreatePolicyVersion",
+                "iam:DeletePolicyVersion",
+                "iam:GetPolicy",
+                "iam:GetPolicyVersion",
+                "iam:ListPolicyVersions",
+                "iam:SetDefaultPolicyVersion",
+                "iam:ListPolicies"
+            ],
+            "Resource": "arn:aws:iam::265982090451:policy/rhel-graviton-policy"
         },
         {
             "Effect": "Allow",
