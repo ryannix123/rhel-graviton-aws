@@ -1,0 +1,281 @@
+---
+# Playbook to deploy RHEL 9 Graviton instances on AWS with Podman, Load Balancer, and SSL
+- name: Deploy RHEL 9 Graviton instances on AWS
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - amazon.aws
+  vars:
+    aws_region: "us-east-2"
+    instance_type: "t4g.small"
+    ami_id: "ami-0b2ab21ce762d2a6f"  # RHEL 9 for ARM64/Graviton in us-east-2
+    key_name: "my-keypair"
+    security_group_name: "rhel9-sg"
+    trusted_ssh_cidr: "207.96.41.124/32"  # Replace with your trusted IP range
+    vpc_cidr: "10.0.0.0/16"
+    ssh_public_key_path: "~/.ssh/id_rsa.pub"  # Replace with your public key path
+
+    # Red Hat Subscription Manager (RHSM) Credentials
+    rhsm_username: "rh_user_name"
+    rhsm_password: "rh_user_password"
+
+    # AWS Certificate Manager (ACM) for ALB SSL
+    certificate_domain: "*.elb.amazonaws.com"  # AWS ALB default domain
+
+    subnets:
+      - az: "us-east-2a"
+        cidr: "10.0.1.0/24"
+      - az: "us-east-2b"
+        cidr: "10.0.2.0/24"
+      - az: "us-east-2c"
+        cidr: "10.0.3.0/24"
+    
+    # Container Configuration
+    container_registry: "quay.io" # Your registry, and then the username and password
+    registry_username: "registry_user_name"
+    registry_password: "registry_password_or_api_key"
+    container_image: "quay.io/ryan_nix/hello-rhel9-graviton:latest" # which container to pull
+    container_name: "rhel9-graviton"
+    container_ports: "8080:8080"
+    container_env:
+      - "ENV=production"
+      - "DEBUG=false"
+
+  tasks:
+    - name: Read SSH public key
+      ansible.builtin.slurp:
+        src: "{{ ssh_public_key_path }}"
+      register: ssh_pub_key
+
+    - name: Create VPC
+      ec2_vpc_net:
+        name: "rhel9-vpc"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "rhel9-vpc"
+      register: vpc
+
+    - name: Create Internet Gateway
+      ec2_vpc_igw:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        state: present
+        tags:
+          Name: "rhel9-igw"
+      register: igw
+
+    - name: Create Subnets
+      ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ item.cidr }}"
+        az: "{{ item.az }}"
+        region: "{{ aws_region }}"
+        state: present
+        tags:
+          Name: "rhel9-subnet-{{ item.az }}"
+      loop: "{{ subnets }}"
+      register: vpc_subnets
+
+    - name: Create Route Table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        routes:
+          - dest: "0.0.0.0/0"
+            gateway_id: "{{ igw.gateway_id }}"
+        subnets: "{{ vpc_subnets.results | map(attribute='subnet.id') | list }}"
+        tags:
+          Name: "rhel9-route-table"
+      register: route_table
+
+    - name: Create Security Group
+      ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: "Allow SSH and HTTPS"
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 443
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: "{{ trusted_ssh_cidr }}"
+          - proto: tcp
+            ports:
+              - 8080
+            cidr_ip: "0.0.0.0/0"  # Application port for health checks
+        tags:
+          Name: "{{ security_group_name }}"
+      register: security_group
+
+    - name: Request SSL Certificate
+      aws_acm:
+        domain_name: "{{ certificate_domain }}"
+        validation_method: "DNS"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ certificate_domain }}"
+      register: acm_cert
+
+    - name: Wait for Certificate validation
+      command: 
+        cmd: "aws acm describe-certificate --certificate-arn {{ acm_cert.certificate_arn }} --region {{ aws_region }}"
+      register: cert_status
+      until: (cert_status.stdout | from_json).Certificate.Status == "ISSUED"
+      retries: 10
+      delay: 30
+      changed_when: false
+
+    - name: Launch RHEL 9 Instances
+      ec2_instance:
+        name: "rhel9-instance-{{ item.az }}"
+        key_name: "{{ key_name }}"
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        vpc_subnet_id: "{{ item.subnet.id }}"
+        security_group: "{{ security_group.group_id }}"
+        network:
+          assign_public_ip: yes
+        tags:
+          Name: "rhel9-instance-{{ item.az }}"
+          Application: "rhel9-graviton"
+        wait: yes
+      loop: "{{ vpc_subnets.results }}"
+      register: ec2_instances
+
+    - name: Add new instances to host group
+      add_host:
+        name: "{{ item.instances[0].public_ip_address }}"
+        groups: graviton_instances
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "~/.ssh/{{ key_name }}.pem"
+      loop: "{{ ec2_instances.results }}"
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ item.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 320
+      loop: "{{ ec2_instances.results }}"
+
+- name: Configure RHEL 9 instances
+  hosts: graviton_instances
+  become: true
+  gather_facts: false
+  vars:
+    # Red Hat Subscription Manager (RHSM) Credentials
+    rhsm_username: "{{ hostvars['localhost']['rhsm_username'] }}"
+    rhsm_password: "{{ hostvars['localhost']['rhsm_password'] }}"
+    rhsm_pool_id: "{{ hostvars['localhost']['rhsm_pool_id'] }}"
+    
+    # Container Configuration
+    container_registry: "{{ hostvars['localhost']['container_registry'] }}"
+    registry_username: "{{ hostvars['localhost']['registry_username'] }}"
+    registry_password: "{{ hostvars['localhost']['registry_password'] }}"
+    container_image: "{{ hostvars['localhost']['container_image'] }}"
+    container_name: "{{ hostvars['localhost']['container_name'] }}"
+    container_ports: "{{ hostvars['localhost']['container_ports'] }}"
+    container_env: "{{ hostvars['localhost']['container_env'] }}"
+    
+  tasks:
+    - name: Upload SSH Public Key
+      authorized_key:
+        user: ec2-user
+        key: "{{ hostvars['localhost']['ssh_pub_key']['content'] | b64decode }}"
+        state: present
+
+    - name: Register RHEL with Subscription Manager
+      shell: |
+        subscription-manager register --username={{ rhsm_username }} --password={{ rhsm_password }} --auto-attach || true
+        subscription-manager attach --pool={{ rhsm_pool_id }} || true
+        subscription-manager refresh
+        subscription-manager repos --enable=rhel-9-for-arm-64-baseos-rpms
+      register: rhsm_result
+      failed_when: false
+      changed_when: rhsm_result.rc == 0
+
+    - name: Install Podman
+      yum:
+        name: podman
+        state: present
+        update_cache: yes
+
+    - name: Log in to Container Registry
+      shell: >
+        podman login -u {{ registry_username }} -p {{ registry_password }} {{ container_registry }}
+      register: podman_login
+      failed_when: false
+      changed_when: podman_login.rc == 0
+
+    - name: Pull Container Image
+      shell: >
+        podman pull {{ container_image }}
+      register: podman_pull
+      changed_when: podman_pull.rc == 0
+
+    - name: Run Container
+      shell: >
+        podman run -d --name {{ container_name }}
+        -p {{ container_ports }}
+        {% for env_var in container_env %}
+        -e {{ env_var }}
+        {% endfor %}
+        {{ container_image }}
+      register: podman_run
+      changed_when: podman_run.rc == 0
+
+- name: Create and Configure Load Balancer
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - amazon.aws
+  vars:
+    aws_region: "{{ hostvars['localhost']['aws_region'] }}"
+  tasks:
+    - name: Create Target Group
+      elb_target_group:
+        name: "rhel9-target-group"
+        protocol: HTTP
+        port: 8080
+        vpc_id: "{{ hostvars['localhost']['vpc']['vpc']['id'] }}"
+        health_check_path: "/"
+        health_check_protocol: HTTP
+        region: "{{ aws_region }}"
+        target_type: instance
+        targets: "{{ hostvars['localhost']['ec2_instances']['results'] | map(attribute='instance_ids[0]') | list }}"
+        successful_response_codes: "200,202,302"
+        tags:
+          Name: "rhel9-target-group"
+      register: target_group
+
+    - name: Deploy Load Balancer with HTTPS Listener
+      amazon.aws.elb_application_lb:
+       name: "rhel9-load-balancer"
+       state: present
+       region: "{{ aws_region }}"
+       subnets: "{{ hostvars['localhost']['vpc_subnets']['results'] | map(attribute='subnet.id') | list }}"
+       security_groups: ["{{ hostvars['localhost']['security_group']['group_id'] }}"]
+       scheme: internet-facing
+       ip_address_type: ipv4
+       listeners:
+        - protocol: HTTPS
+          port: 443
+          ssl_policy: "ELBSecurityPolicy-2016-08"
+          certificates:
+            - certificate_arn: "{{ hostvars['localhost']['acm_cert']['certificate_arn'] }}"
+          default_actions:
+          - type: forward
+            target_group_arn: "{{ target_group.target_group_arn }}"
+       tags:
+          Name: "rhel9-load-balancer"
+      register: alb
+
+    - name: Output Load Balancer URL
+      debug:
+        msg: "Access your application at https://{{ alb.dns_name }}"
