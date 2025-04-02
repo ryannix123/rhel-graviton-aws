@@ -167,7 +167,7 @@ This playbook will:
 
 ---
 
-## <img src="https://www.vectorlogo.zone/logos/podmanio/podmanio-icon.svg" width="25" style="vertical-align: middle; margin-right: 5px;"> **Why Use Podman for Containerized Applications?**
+## <img src="https://www.vectorlogo.zone/logos/podmanio/podmanio-ar21.svg" width="25" style="vertical-align: middle; margin-right: 5px;"> **Why Use Podman for Containerized Applications?**
 
 Podman is a **secure, lightweight, and daemonless** container engine designed for running, managing, and deploying containers. Unlike Docker, it does **not require a background daemon**, making it **more secure and resource-efficient**.
 
