@@ -1,0 +1,114 @@
+---
+# Simplified playbook to clean up IAM user and related resources for RHEL Graviton deployments
+- name: Clean up IAM user for RHEL Graviton deployments
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    user_name: "rhel-graviton-deployer"
+    policy_name: "RHELGravitonDeploymentPolicy"
+    credentials_file: "{{ user_name }}-credentials.txt"
+
+  tasks:
+  - name: Check if AWS CLI is installed
+    command: which aws
+    register: aws_cli_check
+    failed_when: false
+    changed_when: false
+
+  - name: Fail if AWS CLI is not installed
+    fail:
+      msg: "AWS CLI is not installed. Please install it first."
+    when: aws_cli_check.rc != 0
+
+  # Check if user exists before trying to delete
+  - name: Check if user exists
+    shell: >
+      aws iam get-user --user-name "{{ user_name }}" 2>&1 || echo "UserNotFound"
+    register: user_exists
+    changed_when: false
+    failed_when: false
+
+  # Get policy ARN
+  - name: Get policy ARN
+    shell: >
+      aws iam list-policies --query "Policies[?PolicyName=='{{ policy_name }}'].Arn" --output text
+    register: policy_arn
+    changed_when: false
+    failed_when: false
+
+  # List access keys only if user exists
+  - name: List all access keys for the user
+    shell: >
+      aws iam list-access-keys --user-name "{{ user_name }}" --query "AccessKeyMetadata[*].AccessKeyId" --output text
+    register: access_keys
+    failed_when: false
+    changed_when: false
+    when: "'UserNotFound' not in user_exists.stdout"
+
+  # Delete access keys
+  - name: Delete all access keys for the user
+    shell: >
+      aws iam delete-access-key --user-name "{{ user_name }}" --access-key-id "{{ item }}"
+    loop: "{{ access_keys.stdout_lines | default([]) }}"
+    when: "'UserNotFound' not in user_exists.stdout and access_keys.stdout is defined and access_keys.stdout != ''"
+    failed_when: false
+    changed_when: true
+
+  # Detach all policies from user
+  - name: Detach all policies from user
+    shell: >
+      aws iam detach-user-policy --user-name "{{ user_name }}" --policy-arn "{{ policy_arn.stdout }}"
+    when: "'UserNotFound' not in user_exists.stdout and policy_arn.stdout != ''"
+    failed_when: false
+    changed_when: true
+
+  # Delete user
+  - name: Delete IAM user
+    shell: >
+      aws iam delete-user --user-name "{{ user_name }}"
+    when: "'UserNotFound' not in user_exists.stdout"
+    failed_when: false
+    changed_when: true
+
+  # Delete policy
+  - name: Delete IAM policy
+    shell: >
+      aws iam delete-policy --policy-arn "{{ policy_arn.stdout }}"
+    when: policy_arn.stdout != ""
+    failed_when: false
+    changed_when: true
+
+  # Remove AWS configuration
+  - name: Remove user profile from AWS credentials file
+    blockinfile:
+      path: ~/.aws/credentials
+      marker: "# {mark} ANSIBLE MANAGED BLOCK FOR {{ user_name }}"
+      state: absent
+    failed_when: false
+
+  - name: Remove user profile from AWS config file
+    blockinfile:
+      path: ~/.aws/config
+      marker: "# {mark} ANSIBLE MANAGED BLOCK FOR {{ user_name }}"
+      state: absent
+    failed_when: false
+
+  # Remove credentials file
+  - name: Remove credentials backup file
+    file:
+      path: "{{ credentials_file }}"
+      state: absent
+    failed_when: false
+
+  - name: Display cleanup information
+    debug:
+      msg:
+      - "=========================="
+      - "Cleanup completed successfully!"
+      - "=========================="
+      - "Removed IAM user: {{ user_name }}"
+      - "Removed IAM policy: {{ policy_name }}"
+      - "Removed AWS CLI profile configuration for {{ user_name }}"
+      - "Removed credentials file: {{ credentials_file }}"
+      - "=========================="

@@ -1,0 +1,427 @@
+---
+# Enhanced Playbook to deploy RHEL 9 Graviton instances on AWS with Podman, Load Balancer, and SSL
+# Includes improved state tracking and resource management
+- name: Deploy RHEL 9 Graviton instances on AWS
+  hosts: localhost
+  gather_facts: true  # Needed to get ansible_date_time
+  collections:
+  - amazon.aws
+  vars:
+    # Deployment configuration
+    aws_region: "us-east-2"
+    instance_type: "t4g.small"
+    ami_id: "ami-0b0eb28686013f907" # RHEL 9.5 for ARM64/Graviton in us-east-2
+    security_group_name: "rhel9-sg"
+    trusted_ssh_cidr: "your-ip-address/32" # Replace with your trusted IP range
+    vpc_cidr: "10.0.0.0/16"
+    
+    # Resource tracking configuration
+    deployment_id: "{{ ansible_date_time.date }}-{{ ansible_date_time.time | replace(':', '-') }}"
+    resource_prefix: "rhel9"
+    state_file: "./rhel9-graviton-state-{{ deployment_id }}.json"
+    
+    # Keypair configuration
+    keypair_name: "{{ resource_prefix }}-keypair-{{ ansible_date_time.date }}"
+    ssh_private_key_path: "./{{ keypair_name }}.pem"
+
+    # Red Hat Subscription Manager (RHSM) Credentials
+    rhsm_username: "your-rhsm-username"
+    rhsm_password: "your-rhsm-password"
+
+    # AWS Certificate Manager (ACM) for ALB SSL
+    certificate_domain: "*.elb.amazonaws.com" # AWS ALB default domain
+
+    # Networking configuration
+    subnets:
+    - az: "us-east-2a"
+      cidr: "10.0.1.0/24"
+    - az: "us-east-2b"
+      cidr: "10.0.2.0/24"
+    - az: "us-east-2c"
+      cidr: "10.0.3.0/24"
+      
+    # Container Configuration
+    container_registry: "quay.io" 
+    registry_username: "your-registry-username"
+    registry_password: "your-registry-password"
+    container_image: "quay.io/your-username/your-container-image:latest"
+    container_name: "rhel9-graviton"
+    container_ports: "8080:8080"
+    container_env:
+    - "ENV=production"
+    - "DEBUG=false"
+    
+    # Common tags for all AWS resources
+    common_tags:
+      Project: "RHEL9-Graviton"
+      Environment: "Demo"
+      ManagedBy: "Ansible"
+      ResourcePrefix: "{{ resource_prefix }}"
+      DeploymentID: "{{ deployment_id }}"
+      Owner: "RHEL-Solutions-Architect"
+
+  tasks:
+  # Initialize the state file for resource tracking
+  - name: Initialize resource state file
+    copy:
+      content: "{ \"deployment_id\": \"{{ deployment_id }}\", \"resources\": { \"ec2_instances\": [], \"keypairs\": [], \"security_groups\": [], \"vpcs\": [], \"subnets\": [], \"internet_gateways\": [], \"route_tables\": [], \"target_groups\": [], \"load_balancers\": [], \"certificates\": [] } }"
+      dest: "{{ state_file }}"
+      mode: '0600'
+    
+  # Create Resource Group for tracking
+  - name: Create AWS Resource Group for this deployment
+    command: >
+      aws resource-groups create-group 
+      --name {{ resource_prefix }}-group-{{ deployment_id }} 
+      --resource-query '{"Type":"TAG_FILTERS_1_0","Query":"{\"ResourceTypeFilters\":[\"AWS::AllSupported\"],\"TagFilters\":[{\"Key\":\"DeploymentID\",\"Values\":[\"{{ deployment_id }}\"]}]}"}'
+      --region {{ aws_region }}
+    register: resource_group_result
+    failed_when: false
+    changed_when: resource_group_result.rc == 0
+    
+  - name: Add Resource Group ID to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"resource_group":'
+      line: '  "resource_group": "{{ resource_prefix }}-group-{{ deployment_id }}",'
+      insertafter: '"deployment_id":'
+    when: resource_group_result.rc == 0
+
+  # Add tasks to create the keypair
+  - name: Create a new EC2 key pair
+    amazon.aws.ec2_key:
+      name: "{{ keypair_name }}"
+      region: "{{ aws_region }}"
+      tags: "{{ common_tags }}"
+    register: keypair_result
+
+  - name: Save private key
+    copy:
+      content: "{{ keypair_result.key.private_key }}"
+      dest: "{{ ssh_private_key_path }}"
+      mode: '0600'
+    when: keypair_result.changed and keypair_result.key.private_key is defined
+
+  - name: Set fact for generated public key
+    set_fact:
+      ssh_public_key: "{{ keypair_result.key.public_key }}"
+    when: keypair_result.changed and keypair_result.key.public_key is defined
+    
+  - name: Debug SSH public key
+    debug:
+      var: ssh_public_key
+    when: ssh_public_key is defined
+    
+  - name: Add keypair to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"keypairs":'
+      line: '    "keypairs": ["{{ keypair_name }}"],'
+      backrefs: yes
+
+  - name: Store keypair info in SSM Parameter Store
+    command: >
+      aws ssm put-parameter
+      --name "/{{ resource_prefix }}/{{ deployment_id }}/keypair-name"
+      --value "{{ keypair_name }}"
+      --type String
+      --tags Key=DeploymentID,Value={{ deployment_id }}
+      --region {{ aws_region }}
+    register: ssm_keypair_result
+    failed_when: false
+    changed_when: ssm_keypair_result.rc == 0
+
+  - name: Create VPC
+    ec2_vpc_net:
+      name: "{{ resource_prefix }}-vpc"
+      cidr_block: "{{ vpc_cidr }}"
+      region: "{{ aws_region }}"
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-vpc'}) }}"
+    register: vpc
+
+  - name: Add VPC ID to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"vpcs":'
+      line: '    "vpcs": ["{{ vpc.vpc.id }}"],'
+      backrefs: yes
+
+  - name: Store VPC ID in SSM Parameter Store
+    command: >
+      aws ssm put-parameter
+      --name "/{{ resource_prefix }}/{{ deployment_id }}/vpc-id"
+      --value "{{ vpc.vpc.id }}"
+      --type String
+      --tags Key=DeploymentID,Value={{ deployment_id }}
+      --region {{ aws_region }}
+    register: ssm_vpc_result
+    failed_when: false
+    changed_when: ssm_vpc_result.rc == 0
+
+  - name: Create Internet Gateway
+    ec2_vpc_igw:
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ aws_region }}"
+      state: present
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-igw'}) }}"
+    register: igw
+
+  - name: Add Internet Gateway ID to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"internet_gateways":'
+      line: '    "internet_gateways": ["{{ igw.gateway_id }}"],'
+      backrefs: yes
+
+  - name: Create Subnets
+    ec2_vpc_subnet:
+      vpc_id: "{{ vpc.vpc.id }}"
+      cidr: "{{ item.cidr }}"
+      az: "{{ item.az }}"
+      region: "{{ aws_region }}"
+      state: present
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-subnet-' + item.az}) }}"
+    loop: "{{ subnets }}"
+    register: vpc_subnets
+
+  - name: Extract subnet IDs to list
+    set_fact:
+      subnet_ids: "{{ vpc_subnets.results | map(attribute='subnet.id') | list }}"
+
+  - name: Add subnet IDs to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"subnets":'
+      line: '    "subnets": {{ subnet_ids | to_json }},'
+      backrefs: yes
+
+  - name: Create Route Table
+    ec2_vpc_route_table:
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ aws_region }}"
+      routes:
+      - dest: "0.0.0.0/0"
+        gateway_id: "{{ igw.gateway_id }}"
+      subnets: "{{ subnet_ids }}"
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-route-table'}) }}"
+    register: route_table
+
+  - name: Add route table ID to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"route_tables":'
+      line: '    "route_tables": ["{{ route_table.route_table.id }}"],'
+      backrefs: yes
+
+  - name: Create Security Group
+    ec2_security_group:
+      name: "{{ security_group_name }}"
+      description: "Allow SSH and HTTPS"
+      vpc_id: "{{ vpc.vpc.id }}"
+      region: "{{ aws_region }}"
+      rules:
+      - proto: tcp
+        ports:
+        - 443
+        cidr_ip: "0.0.0.0/0"
+      - proto: tcp
+        ports:
+        - 22
+        cidr_ip: "{{ trusted_ssh_cidr }}"
+      - proto: tcp
+        ports:
+        - 8080
+        cidr_ip: "0.0.0.0/0" # Application port for health checks
+      tags: "{{ common_tags | combine({'Name': security_group_name}) }}"
+    register: security_group
+
+  - name: Add security group ID to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"security_groups":'
+      line: '    "security_groups": ["{{ security_group.group_id }}"],'
+      backrefs: yes
+
+  # Request certificate using AWS CLI
+  - name: Request SSL Certificate via AWS CLI
+    shell: >
+      aws acm request-certificate 
+      --domain-name {{ certificate_domain }} 
+      --validation-method DNS 
+      --region {{ aws_region }} 
+      --tags Key=Name,Value=cert-elb-aws Key=DeploymentID,Value={{ deployment_id }} 
+      --query 'CertificateArn' 
+      --output text
+    register: acm_cert_result
+    changed_when: acm_cert_result.rc == 0
+
+  - name: Set certificate ARN
+    set_fact:
+      certificate_arn: "{{ acm_cert_result.stdout }}"
+
+  - name: Add certificate ARN to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"certificates":'
+      line: '    "certificates": ["{{ certificate_arn }}"],'
+      backrefs: yes
+
+  - name: Wait for Certificate processing
+    shell:
+      cmd: "aws acm describe-certificate --certificate-arn {{ certificate_arn }} --region {{ aws_region }} --query 'Certificate.Status' --output text"
+    register: cert_status
+    changed_when: false
+
+  - name: Display certificate status
+    debug:
+      msg: "Certificate status: {{ cert_status.stdout }}"
+
+  - name: Launch RHEL 9 Instances
+    ec2_instance:
+      name: "{{ resource_prefix }}-instance-{{ item.subnet.availability_zone }}"
+      key_name: "{{ keypair_name }}"
+      region: "{{ aws_region }}"
+      instance_type: "{{ instance_type }}"
+      image_id: "{{ ami_id }}"
+      vpc_subnet_id: "{{ item.subnet.id }}"
+      security_group: "{{ security_group.group_id }}"
+      network:
+        assign_public_ip: yes
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-instance-' + item.subnet.availability_zone, 'Application': resource_prefix + '-graviton'}) }}"
+      wait: yes
+      user_data: |
+        #!/bin/bash
+        echo "====== Starting RHEL 9 Graviton Instance Configuration ======" > /var/log/user-data.log
+        
+        # Register with RHSM
+        echo "Registering with Red Hat Subscription Manager..." >> /var/log/user-data.log
+        subscription-manager register --username={{ rhsm_username }} --password={{ rhsm_password }} --auto-attach || true
+        subscription-manager refresh
+        subscription-manager repos --enable=rhel-9-for-arm-64-baseos-rpms
+        
+        # Install Podman
+        echo "Installing Podman..." >> /var/log/user-data.log
+        yum -y install podman
+        
+        # Login to container registry
+        echo "Logging into container registry..." >> /var/log/user-data.log
+        podman login -u {{ registry_username }} -p {{ registry_password }} {{ container_registry }}
+        
+        # Pull and run container
+        echo "Pulling and running container..." >> /var/log/user-data.log
+        podman pull {{ container_image }}
+        podman run -d --name {{ container_name }} -p {{ container_ports }} {% for env_var in container_env %} -e {{ env_var }} {% endfor %} {{ container_image }}
+        
+        echo "====== Completed RHEL 9 Graviton Instance Configuration ======" >> /var/log/user-data.log
+    loop: "{{ vpc_subnets.results }}"
+    register: ec2_instances
+
+  - name: Extract instance IDs to list
+    set_fact:
+      instance_ids: "{{ ec2_instances.results | map(attribute='instance_ids') | map('first') | list }}"
+      instance_ips: "{{ ec2_instances.results | map(attribute='instances') | map('first') | map(attribute='public_ip_address') | list }}"
+
+  - name: Add instance IDs to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"ec2_instances":'
+      line: '    "ec2_instances": {{ instance_ids | to_json }},'
+      backrefs: yes
+
+  - name: Store instance IDs in SSM Parameter Store
+    command: >
+      aws ssm put-parameter
+      --name "/{{ resource_prefix }}/{{ deployment_id }}/instance-ids"
+      --value "{{ instance_ids | join(',') }}"
+      --type StringList
+      --tags Key=DeploymentID,Value={{ deployment_id }}
+      --region {{ aws_region }}
+    register: ssm_instances_result
+    failed_when: false
+    changed_when: ssm_instances_result.rc == 0
+
+  - name: Wait for instance status checks to pass
+    command: >
+      aws ec2 describe-instance-status
+      --instance-ids {{ item }}
+      --region {{ aws_region }}
+      --query 'InstanceStatuses[0].InstanceStatus.Status'
+      --output text
+    register: instance_status
+    until: instance_status.stdout == "ok"
+    retries: 20
+    delay: 30
+    loop: "{{ instance_ids }}"
+
+  - name: Create Target Group
+    elb_target_group:
+      name: "{{ resource_prefix }}-target-group"
+      protocol: HTTP
+      port: 8080
+      vpc_id: "{{ vpc.vpc.id }}"
+      health_check_path: "/"
+      health_check_protocol: HTTP
+      region: "{{ aws_region }}"
+      target_type: instance
+      targets: "{{ instance_ids }}"
+      successful_response_codes: "200,202,302"
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-target-group'}) }}"
+    register: target_group
+
+  - name: Add target group ARN to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"target_groups":'
+      line: '    "target_groups": ["{{ target_group.target_group_arn }}"],'
+      backrefs: yes
+
+  - name: Deploy Load Balancer with HTTPS Listener
+    amazon.aws.elb_application_lb:
+      name: "{{ resource_prefix }}-load-balancer"
+      state: present
+      region: "{{ aws_region }}"
+      subnets: "{{ subnet_ids }}"
+      security_groups: [ "{{ security_group.group_id }}" ]
+      scheme: internet-facing
+      ip_address_type: ipv4
+      listeners:
+      - protocol: HTTPS
+        port: 443
+        ssl_policy: "ELBSecurityPolicy-2016-08"
+        certificates:
+        - certificate_arn: "{{ certificate_arn }}"
+        default_actions:
+        - type: forward
+          target_group_arn: "{{ target_group.target_group_arn }}"
+      tags: "{{ common_tags | combine({'Name': resource_prefix + '-load-balancer'}) }}"
+    register: alb
+
+  - name: Add load balancer ARN to state file
+    lineinfile:
+      path: "{{ state_file }}"
+      regexp: '"load_balancers":'
+      line: '    "load_balancers": ["{{ alb.load_balancer_arn }}"],'
+      backrefs: yes
+
+  - name: Save full state to state file
+    copy:
+      content: "{{ vars | to_json }}"
+      dest: "{{ state_file }}.full"
+      mode: '0600'
+
+  - name: Output Load Balancer URL
+    debug:
+      msg: "Access your application at https://{{ alb.dns_name }}"
+
+  - name: Output Keypair Information
+    debug:
+      msg: 
+        - "EC2 instances were created with keypair: {{ keypair_name }}"
+        - "Private key is stored at: {{ ssh_private_key_path }}"
+
+  - name: Output State File Location
+    debug:
+      msg:
+        - "Deployment ID: {{ deployment_id }}"
+        - "Resource state file: {{ state_file }}"
+        - "To clean up resources, run: ansible-playbook cleanup-playbook.yml -e @{{ state_file }}"

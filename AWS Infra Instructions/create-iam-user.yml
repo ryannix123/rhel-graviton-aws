@@ -1,0 +1,222 @@
+---
+# Simplified playbook to create an IAM user with permissions for RHEL Graviton deployments
+- name: Create IAM user for RHEL Graviton deployments
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    user_name: "rhel-graviton-deployer"
+    policy_name: "RHELGravitonDeploymentPolicy"
+    region: "us-east-2"
+    credentials_file: "{{ user_name }}-credentials.txt"
+
+  tasks:
+  - name: Check if AWS CLI is installed
+    command: which aws
+    register: aws_cli_check
+    failed_when: false
+    changed_when: false
+
+  - name: Fail if AWS CLI is not installed
+    fail:
+      msg: "AWS CLI is not installed. Please install it first."
+    when: aws_cli_check.rc != 0
+
+  - name: Get AWS Account ID
+    shell: aws sts get-caller-identity --query "Account" --output text
+    register: account_id
+    changed_when: false
+
+  - name: Fail if Account ID cannot be retrieved
+    fail:
+      msg: "Failed to get AWS Account ID. Make sure you have configured AWS CLI."
+    when: account_id.stdout == ""
+
+  # Clean up any existing resources first
+  - name: Check if user exists
+    shell: >
+      aws iam get-user --user-name "{{ user_name }}" 2>&1 || echo "UserNotFound"
+    register: user_exists
+    changed_when: false
+    failed_when: false
+
+  - name: List all access keys for the user if user exists
+    shell: >
+      aws iam list-access-keys --user-name "{{ user_name }}" --query "AccessKeyMetadata[*].AccessKeyId" --output text
+    register: access_keys
+    failed_when: false
+    changed_when: false
+    when: "'UserNotFound' not in user_exists.stdout"
+
+  - name: Delete all access keys for the user
+    shell: >
+      aws iam delete-access-key --user-name "{{ user_name }}" --access-key-id "{{ item }}"
+    loop: "{{ access_keys.stdout_lines | default([]) }}"
+    when: "access_keys is defined and access_keys.stdout is defined and access_keys.stdout != ''"
+    failed_when: false
+    changed_when: true
+
+  - name: Get existing policy ARN
+    shell: >
+      aws iam list-policies --query "Policies[?PolicyName=='{{ policy_name }}'].Arn" --output text
+    register: policy_arn_check
+    changed_when: false
+    failed_when: false
+
+  - name: Detach existing policy from user
+    shell: >
+      aws iam detach-user-policy --user-name "{{ user_name }}" --policy-arn "{{ policy_arn_check.stdout }}"
+    when: "'UserNotFound' not in user_exists.stdout and policy_arn_check.stdout != ''"
+    failed_when: false
+    changed_when: true
+
+  - name: Delete existing policy
+    shell: >
+      aws iam delete-policy --policy-arn "{{ policy_arn_check.stdout }}"
+    when: "policy_arn_check.stdout != ''"
+    failed_when: false
+    changed_when: true
+
+  - name: Delete existing user
+    shell: >
+      aws iam delete-user --user-name "{{ user_name }}"
+    when: "'UserNotFound' not in user_exists.stdout"
+    failed_when: false
+    changed_when: true
+
+  # Wait a moment for AWS to process the deletion
+  - name: Wait for user deletion to propagate
+    pause:
+      seconds: 5
+    when: "'UserNotFound' not in user_exists.stdout"
+
+  # Create new resources
+  - name: Create IAM policy
+    shell: >
+      aws iam create-policy --policy-name "{{ policy_name }}" --policy-document file://rhel-graviton-policy.json --query 'Policy.Arn' --output text
+    register: policy_create
+    failed_when: policy_create.rc != 0
+    changed_when: policy_create.rc == 0
+
+  - name: Create IAM user
+    shell: aws iam create-user --user-name "{{ user_name }}"
+    register: user_create
+    failed_when: user_create.rc != 0
+    changed_when: user_create.rc == 0
+
+  - name: Attach policy to user
+    shell: >
+      aws iam attach-user-policy --user-name "{{ user_name }}" --policy-arn "{{ policy_create.stdout }}"
+    register: policy_attach
+    failed_when: policy_attach.rc != 0
+    changed_when: policy_attach.rc == 0
+
+  # Access key creation
+  - name: Create access key
+    shell: >
+      aws iam create-access-key  --user-name "{{ user_name }}"  --output json
+    register: access_key
+    failed_when: access_key.rc != 0
+    changed_when: access_key.rc == 0
+
+  - name: Set access key variables
+    set_fact:
+      access_key_id: "{{ (access_key.stdout | from_json).AccessKey.AccessKeyId }}"
+      secret_access_key: "{{ (access_key.stdout | from_json).AccessKey.SecretAccessKey }}"
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  # AWS credentials configuration
+  - name: Create AWS credentials directory
+    file:
+      path: ~/.aws
+      state: directory
+      mode: '0700'
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Check if AWS credentials file exists
+    stat:
+      path: ~/.aws/credentials
+    register: credentials_file_check
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Create AWS credentials file if it doesn't exist
+    copy:
+      dest: ~/.aws/credentials
+      content: |
+        [default]
+        aws_access_key_id = YOUR_DEFAULT_ACCESS_KEY
+        aws_secret_access_key = YOUR_DEFAULT_SECRET_KEY
+
+      mode: '0600'
+    when: access_key.rc == 0 and access_key.stdout != "" and credentials_file_check.stat is defined and not credentials_file_check.stat.exists
+
+  - name: Check if AWS config file exists
+    stat:
+      path: ~/.aws/config
+    register: config_file_check
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Create AWS config file if it doesn't exist
+    copy:
+      dest: ~/.aws/config
+      content: |
+        [default]
+        region = {{ region }}
+        output = json
+
+      mode: '0600'
+    when: access_key.rc == 0 and access_key.stdout != "" and config_file_check.stat is defined and not config_file_check.stat.exists
+
+  - name: Add user profile to AWS credentials file
+    blockinfile:
+      path: ~/.aws/credentials
+      marker: "# {mark} ANSIBLE MANAGED BLOCK FOR {{ user_name }}"
+      block: |
+        [{{ user_name }}]
+        aws_access_key_id = {{ access_key_id }}
+        aws_secret_access_key = {{ secret_access_key }}
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Add user profile to AWS config file
+    blockinfile:
+      path: ~/.aws/config
+      marker: "# {mark} ANSIBLE MANAGED BLOCK FOR {{ user_name }}"
+      block: |
+        [profile {{ user_name }}]
+        region = {{ region }}
+        output = json
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Save credentials to file for backup
+    copy:
+      dest: "{{ credentials_file }}"
+      content: |
+        =========================
+        AWS IAM User Credentials
+        =========================
+        User Name: {{ user_name }}
+        Access Key ID: {{ access_key_id }}
+        Secret Access Key: {{ secret_access_key }}
+        =========================
+        Keep this file secure and delete it when no longer needed.
+      mode: '0600'
+    when: access_key.rc == 0 and access_key.stdout != ""
+
+  - name: Display user information
+    debug:
+      msg:
+      - "=========================="
+      - "Setup completed successfully!"
+      - "=========================="
+      - "User Name: {{ user_name }}"
+      - "Access Key ID: {{ access_key_id }}"
+      - "Secret Access Key: {{ secret_access_key }}"
+      - ""
+      - "The AWS profile '{{ user_name }}' has been configured in your AWS credentials."
+      - "You can use this profile with the AWS CLI by specifying --profile {{ user_name }}"
+      - "or by setting the environment variable: export AWS_PROFILE={{ user_name }}"
+      - ""
+      - "IMPORTANT: Store these credentials securely. This is the only time the"
+      - "secret access key will be displayed."
+      - "=========================="
+    when: access_key.rc == 0 and access_key.stdout != ""

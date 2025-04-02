@@ -1,0 +1,640 @@
+---
+# Improved Playbook to clean up all resources created by the RHEL 9 Graviton deployment
+- name: Cleanup AWS resources for RHEL 9 Graviton deployment
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - amazon.aws
+  vars:
+    aws_region: "us-east-2"
+    # This variable helps identify resources created by our deployment
+    resource_prefix: "rhel9"
+    # Specify the keypair name pattern if known, or leave commented out to detect all
+    # keypair_name_pattern: "rhel9-keypair-*"
+  
+  tasks:
+    - name: Set empty lists for all resources
+      set_fact:
+        load_balancers: []
+        target_groups: []
+        instances: []
+        keypairs: []
+        security_groups: []
+        subnets: []
+        route_tables: []
+        internet_gateways: []
+        network_interfaces: []
+        nat_gateways: []
+        vpcs: []
+        certificates: []
+    
+    # ENHANCEMENT 1: Identify all AWS resources first before attempting deletion
+    # This gives us a complete picture of the environment
+
+    # Step 1: Find and catalog load balancers
+    - name: Find load balancers
+      command: >
+        aws elbv2 describe-load-balancers 
+        --region {{ aws_region }} 
+        --query 'LoadBalancers[?contains(LoadBalancerName, `{{ resource_prefix }}`)].{Name:LoadBalancerName,ARN:LoadBalancerArn}'
+        --output json
+      register: lb_output
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse load balancer output
+      set_fact:
+        load_balancers: "{{ lb_output.stdout | from_json }}"
+      when: lb_output.stdout | length > 0
+    
+    - name: Debug - Show discovered load balancers
+      debug:
+        var: load_balancers
+        verbosity: 1
+    
+    # Step 2: Find and catalog target groups
+    - name: Find target groups
+      command: >
+        aws elbv2 describe-target-groups 
+        --region {{ aws_region }} 
+        --query 'TargetGroups[?contains(TargetGroupName, `{{ resource_prefix }}`)].{Name:TargetGroupName,ARN:TargetGroupArn}'
+        --output json
+      register: tg_output
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse target group output
+      set_fact:
+        target_groups: "{{ tg_output.stdout | from_json }}"
+      when: tg_output.stdout | length > 0
+    
+    - name: Debug - Show discovered target groups
+      debug:
+        var: target_groups
+        verbosity: 1
+    
+    # Step 3: Find and catalog instances
+    - name: Find EC2 instances
+      ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ resource_prefix }}-instance-*"
+      register: instance_info
+    
+    - name: Set instance IDs
+      set_fact:
+        instances: "{{ instance_info.instances | map(attribute='instance_id') | list }}"
+      when: instance_info.instances | length > 0
+    
+    - name: Debug - Show discovered instances
+      debug:
+        var: instances
+        verbosity: 1
+    
+    # Step 4: Find and catalog keypairs
+    - name: Find EC2 keypairs
+      command: >
+        aws ec2 describe-key-pairs 
+        --region {{ aws_region }} 
+        --query 'KeyPairs[?starts_with(KeyName, `{{ resource_prefix }}`)].KeyName'
+        --output json
+      register: keypair_output
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse keypair output
+      set_fact:
+        keypairs: "{{ keypair_output.stdout | from_json }}"
+      when: keypair_output.stdout | length > 0
+    
+    - name: Debug - Show discovered keypairs
+      debug:
+        var: keypairs
+        verbosity: 1
+    
+    # Step 5: Find and catalog VPCs
+    - name: Find VPCs
+      ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ resource_prefix }}-vpc"
+      register: vpc_info
+    
+    - name: Set VPC IDs
+      set_fact:
+        vpcs: "{{ vpc_info.vpcs | map(attribute='id') | list }}"
+      when: vpc_info.vpcs | length > 0
+    
+    - name: Debug - Show discovered VPCs
+      debug:
+        var: vpcs
+        verbosity: 1
+    
+    # ENHANCEMENT 2: Find all dependent resources for VPCs
+    
+    # Step 6: Find and catalog NAT Gateways
+    - name: Find NAT Gateways in VPCs
+      command: >
+        aws ec2 describe-nat-gateways 
+        --region {{ aws_region }} 
+        --filter "Name=vpc-id,Values={{ item }}" 
+        --query 'NatGateways[].NatGatewayId'
+        --output json
+      register: nat_gateway_output
+      loop: "{{ vpcs }}"
+      when: vpcs | length > 0
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse NAT Gateway output
+      set_fact:
+        nat_gateways: "{{ nat_gateways + (item.stdout | from_json) }}"
+      loop: "{{ nat_gateway_output.results | default([]) }}"
+      when: nat_gateway_output.results is defined and item.stdout | length > 0
+    
+    - name: Debug - Show discovered NAT Gateways
+      debug:
+        var: nat_gateways
+        verbosity: 1
+    
+    # Step A: Find and catalog network interfaces
+    - name: Find Network Interfaces in VPCs
+      command: >
+        aws ec2 describe-network-interfaces 
+        --region {{ aws_region }} 
+        --filters "Name=vpc-id,Values={{ item }}" 
+        --query 'NetworkInterfaces[].NetworkInterfaceId'
+        --output json
+      register: ni_output
+      loop: "{{ vpcs }}"
+      when: vpcs | length > 0
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse Network Interface output
+      set_fact:
+        network_interfaces: "{{ network_interfaces + (item.stdout | from_json) }}"
+      loop: "{{ ni_output.results | default([]) }}"
+      when: ni_output.results is defined and item.stdout | length > 0
+    
+    - name: Debug - Show discovered Network Interfaces
+      debug:
+        var: network_interfaces
+        verbosity: 1
+    
+    # Step 7: Find and catalog security groups
+    - name: Find security groups
+      ec2_security_group_info:
+        region: "{{ aws_region }}"
+        filters:
+          group-name: "{{ resource_prefix }}-sg*"
+      register: sg_info
+    
+    - name: Set security group IDs
+      set_fact:
+        security_groups: "{{ sg_info.security_groups | map(attribute='group_id') | list }}"
+      when: sg_info.security_groups | length > 0
+    
+    - name: Debug - Show discovered security groups
+      debug:
+        var: security_groups
+        verbosity: 1
+    
+    # Step 8: Find and catalog route tables
+    - name: Find route tables
+      ec2_vpc_route_table_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ resource_prefix }}-route-table*"
+      register: rt_info
+    
+    - name: Set route table IDs
+      set_fact:
+        route_tables: "{{ rt_info.route_tables | map(attribute='id') | list }}"
+      when: rt_info.route_tables | length > 0
+    
+    - name: Debug - Show discovered route tables
+      debug:
+        var: route_tables
+        verbosity: 1
+    
+    # Step 9: Find and catalog subnets
+    - name: Find subnets
+      ec2_vpc_subnet_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ resource_prefix }}-subnet-*"
+      register: subnet_info
+    
+    - name: Set subnet IDs
+      set_fact:
+        subnets: "{{ subnet_info.subnets | map(attribute='id') | list }}"
+      when: subnet_info.subnets | length > 0
+    
+    - name: Debug - Show discovered subnets
+      debug:
+        var: subnets
+        verbosity: 1
+    
+    # Step 10: Find and catalog Internet Gateways
+    - name: Find Internet Gateways for VPCs
+      ec2_vpc_igw_info:
+        region: "{{ aws_region }}"
+        filters:
+          attachment.vpc-id: "{{ item }}"
+      register: igw_info
+      loop: "{{ vpcs }}"
+      when: vpcs | length > 0
+    
+    - name: Set Internet Gateway IDs
+      set_fact:
+        internet_gateways: "{{ internet_gateways + [item.internet_gateways[0].internet_gateway_id] }}"
+      loop: "{{ igw_info.results | default([]) }}"
+      when: igw_info.results is defined and item.internet_gateways is defined and item.internet_gateways | length > 0
+      loop_control:
+        label: "{{ item.internet_gateways[0].internet_gateway_id if (item.internet_gateways is defined and item.internet_gateways | length > 0) else 'No IGW' }}"
+    
+    - name: Debug - Show discovered Internet Gateways
+      debug:
+        var: internet_gateways
+        verbosity: 1
+    
+    # Step 11: Find and catalog certificates
+    - name: Find certificates with specific tag
+      command: >
+        aws acm list-certificates 
+        --region {{ aws_region }} 
+        --query "CertificateSummaryList[?contains(DomainName, '*.elb.amazonaws.com')].CertificateArn"
+        --output json
+      register: cert_output
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse certificate output
+      set_fact:
+        certificates: "{{ cert_output.stdout | from_json }}"
+      when: cert_output.stdout | length > 0
+    
+    - name: Debug - Show discovered certificates
+      debug:
+        var: certificates
+        verbosity: 1
+    
+    # ==========================================
+    # ENHANCEMENT 3: Now delete in proper order with better error handling
+    # ==========================================
+    
+    # Step 1: Delete load balancers first
+    - name: Delete load balancers
+      command: >
+        aws elbv2 delete-load-balancer 
+        --region {{ aws_region }} 
+        --load-balancer-arn {{ item.ARN }}
+      loop: "{{ load_balancers }}"
+      when: load_balancers | length > 0
+      register: delete_lb
+      failed_when: false
+    
+    - name: Debug load balancer deletion
+      debug:
+        var: delete_lb
+      when: delete_lb is defined and delete_lb.results is defined
+    
+    - name: Wait for load balancers to be deleted
+      pause:
+        seconds: 45
+      when: load_balancers | length > 0
+    
+    # Step 2: Delete target groups next
+    - name: Delete target groups
+      command: >
+        aws elbv2 delete-target-group 
+        --region {{ aws_region }} 
+        --target-group-arn {{ item.ARN }}
+      loop: "{{ target_groups }}"
+      when: target_groups | length > 0
+      register: delete_tg
+      failed_when: false
+    
+    - name: Debug target group deletion
+      debug:
+        var: delete_tg
+      when: delete_tg is defined and delete_tg.results is defined
+    
+    - name: Wait for target groups to be deleted
+      pause:
+        seconds: 15
+      when: target_groups | length > 0
+    
+    # Step 3: Terminate instances 
+    - name: Terminate EC2 instances
+      ec2_instance:
+        instance_ids: "{{ instances }}"
+        region: "{{ aws_region }}"
+        state: terminated
+        wait: true
+      when: instances | length > 0
+      register: terminated_instances
+      failed_when: false
+    
+    - name: Debug instance termination
+      debug:
+        var: terminated_instances
+      when: terminated_instances is defined
+    
+    # Wait for instances to terminate
+    - name: Wait for instances to terminate
+      pause:
+        seconds: 60
+      when: instances | length > 0
+    
+    # Step 4: Delete NAT Gateways
+    - name: Delete NAT Gateways
+      command: >
+        aws ec2 delete-nat-gateway
+        --region {{ aws_region }}
+        --nat-gateway-id {{ item }}
+      loop: "{{ nat_gateways }}"
+      when: nat_gateways | length > 0
+      register: delete_nat
+      failed_when: false
+    
+    - name: Debug NAT Gateway deletion
+      debug:
+        var: delete_nat
+      when: delete_nat is defined and delete_nat.results is defined
+    
+    # NAT Gateway deletion can take a while
+    - name: Wait for NAT Gateways to be deleted
+      pause:
+        seconds: 90
+      when: nat_gateways | length > 0
+    
+    # Step 5: Delete network interfaces
+    - name: Delete Network Interfaces
+      command: >
+        aws ec2 delete-network-interface
+        --region {{ aws_region }}
+        --network-interface-id {{ item }}
+      loop: "{{ network_interfaces }}"
+      when: network_interfaces | length > 0
+      register: delete_ni
+      failed_when: false
+    
+    - name: Debug Network Interface deletion
+      debug:
+        var: delete_ni
+      when: delete_ni is defined and delete_ni.results is defined
+    
+    - name: Wait for Network Interfaces to be deleted
+      pause:
+        seconds: 30
+      when: network_interfaces | length > 0
+    
+    # Step 6: Delete security groups
+    - name: Delete security groups
+      ec2_security_group:
+        group_id: "{{ item }}"
+        region: "{{ aws_region }}"
+        state: absent
+      loop: "{{ security_groups }}"
+      when: security_groups | length > 0
+      register: delete_sg
+      failed_when: false
+      until: delete_sg is not failed
+      retries: 6
+      delay: 10
+    
+    - name: Debug security group deletion
+      debug:
+        var: delete_sg
+      when: delete_sg is defined
+    
+    - name: Wait for security groups to be deleted
+      pause:
+        seconds: 30
+      when: security_groups | length > 0
+    
+    # Step 7: Delete route tables (but skip the main route table which cannot be deleted)
+    - name: Delete route tables
+      command: >
+        aws ec2 delete-route-table
+        --region {{ aws_region }}
+        --route-table-id {{ item }}
+      loop: "{{ route_tables }}"
+      when: route_tables | length > 0
+      register: delete_rt
+      failed_when: false
+    
+    - name: Debug route table deletion
+      debug:
+        var: delete_rt
+      when: delete_rt is defined and delete_rt.results is defined
+    
+    - name: Wait for route tables to be deleted
+      pause:
+        seconds: 15
+      when: route_tables | length > 0
+    
+    # Step 8: Delete subnets with AWS CLI command
+    - name: Delete subnets
+      command: >
+        aws ec2 delete-subnet
+        --region {{ aws_region }}
+        --subnet-id {{ item }}
+      loop: "{{ subnets }}"
+      when: subnets | length > 0
+      register: delete_subnet
+      failed_when: false
+    
+    - name: Debug subnet deletion
+      debug:
+        var: delete_subnet
+      when: delete_subnet is defined and delete_subnet.results is defined
+    
+    - name: Wait for subnets to be deleted
+      pause:
+        seconds: 15
+      when: subnets | length > 0
+    
+    # Step 9: Detach and delete Internet Gateways
+    - name: Detach Internet Gateways
+      command: >
+        aws ec2 detach-internet-gateway
+        --region {{ aws_region }}
+        --internet-gateway-id {{ item.1 }}
+        --vpc-id {{ item.0 }}
+      with_nested:
+        - "{{ vpcs }}"
+        - "{{ internet_gateways }}"
+      when: vpcs | length > 0 and internet_gateways | length > 0
+      register: detach_igw
+      failed_when: false
+    
+    - name: Debug Internet Gateway detachment
+      debug:
+        var: detach_igw
+      when: detach_igw is defined
+    
+    - name: Wait after IGW detachment
+      pause:
+        seconds: 15
+      when: internet_gateways | length > 0
+    
+    - name: Delete Internet Gateways
+      command: >
+        aws ec2 delete-internet-gateway
+        --region {{ aws_region }}
+        --internet-gateway-id {{ item }}
+      loop: "{{ internet_gateways }}"
+      when: internet_gateways | length > 0
+      register: delete_igw
+      failed_when: false
+    
+    - name: Debug Internet Gateway deletion
+      debug:
+        var: delete_igw
+      when: delete_igw is defined and delete_igw.results is defined
+    
+    - name: Wait for Internet Gateways to be deleted
+      pause:
+        seconds: 15
+      when: internet_gateways | length > 0
+    
+    # Step 10: Delete VPCs
+    - name: Delete VPCs
+      command: >
+        aws ec2 delete-vpc
+        --region {{ aws_region }}
+        --vpc-id {{ item }}
+      loop: "{{ vpcs }}"
+      when: vpcs | length > 0
+      register: delete_vpc
+      failed_when: false
+    
+    - name: Debug VPC deletion
+      debug:
+        var: delete_vpc
+      when: delete_vpc is defined and delete_vpc.results is defined
+    
+    # Step 11: Delete certificates
+    - name: Delete certificates
+      command: >
+        aws acm delete-certificate
+        --region {{ aws_region }}
+        --certificate-arn {{ item }}
+      loop: "{{ certificates }}"
+      when: certificates | length > 0
+      register: delete_cert
+      failed_when: false
+    
+    - name: Debug certificate deletion
+      debug:
+        var: delete_cert
+      when: delete_cert is defined and delete_cert.results is defined
+    
+    # Step 12: Delete keypairs
+    - name: Delete keypairs
+      ec2_key:
+        name: "{{ item }}"
+        region: "{{ aws_region }}"
+        state: absent
+      loop: "{{ keypairs }}"
+      when: keypairs | length > 0
+      register: delete_keypair
+      failed_when: false
+    
+    - name: Debug keypair deletion
+      debug:
+        var: delete_keypair
+      when: delete_keypair is defined
+    
+    # Step 13: Check if any local files need cleanup
+    - name: Find keypair PEM files
+      find:
+        paths: "~/.ssh"
+        patterns: "{{ resource_prefix }}-keypair-*.pem"
+      register: pem_files
+    
+    - name: Remove keypair PEM files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ pem_files.files }}"
+      when: pem_files.files | length > 0
+    
+    # ENHANCEMENT 4: Verify deletion of all resources
+    - name: Verify VPCs have been deleted
+      command: >
+        aws ec2 describe-vpcs
+        --region {{ aws_region }}
+        --filters "Name=tag:Name,Values={{ resource_prefix }}-vpc"
+        --query 'Vpcs[].VpcId'
+        --output json
+      register: verify_vpc
+      changed_when: false
+      failed_when: false
+    
+    - name: Verify subnets have been deleted
+      command: >
+        aws ec2 describe-subnets
+        --region {{ aws_region }}
+        --filters "Name=tag:Name,Values={{ resource_prefix }}-subnet-*"
+        --query 'Subnets[].SubnetId'
+        --output json
+      register: verify_subnet
+      changed_when: false
+      failed_when: false
+    
+    - name: Verify security groups have been deleted
+      command: >
+        aws ec2 describe-security-groups
+        --region {{ aws_region }}
+        --filters "Name=group-name,Values={{ resource_prefix }}-sg*"
+        --query 'SecurityGroups[].GroupId'
+        --output json
+      register: verify_sg
+      changed_when: false
+      failed_when: false
+    
+    - name: Display cleanup summary
+      debug:
+        msg:
+          - "========== Cleanup Summary =========="
+          - "Load Balancers removed: {{ load_balancers | length }}"
+          - "Target Groups removed: {{ target_groups | length }}"
+          - "EC2 Instances terminated: {{ instances | length }}"
+          - "NAT Gateways removed: {{ nat_gateways | length }}"
+          - "Network Interfaces removed: {{ network_interfaces | length }}"
+          - "Keypairs deleted: {{ keypairs | length }}"
+          - "Security Groups removed: {{ security_groups | length }}"
+          - "Route Tables removed: {{ route_tables | length }}"
+          - "Subnets removed: {{ subnets | length }}"
+          - "Internet Gateways removed: {{ internet_gateways | length }}"
+          - "VPCs removed: {{ vpcs | length }}"
+          - "Certificates deleted: {{ certificates | length }}"
+          - "Local PEM files deleted: {{ pem_files.files | default([]) | length }}"
+          - "===================================="
+    
+    - name: Display remaining resources (if any)
+      debug:
+        msg:
+          - "========== Remaining Resources =========="
+          - "VPCs remaining: {{ verify_vpc.stdout | from_json | length if verify_vpc.stdout else 0 }}"
+          - "Subnets remaining: {{ verify_subnet.stdout | from_json | length if verify_subnet.stdout else 0 }}"
+          - "Security Groups remaining: {{ verify_sg.stdout | from_json | length if verify_sg.stdout else 0 }}"
+          - "========================================="
+      when: verify_vpc is defined and verify_subnet is defined and verify_sg is defined
+    
+    - name: Suggest next steps for any remaining resources
+      debug:
+        msg:
+          - "If resources remain, consider:"
+          - "1. There may be dependencies not captured by this playbook"
+          - "2. Run with AWS_DEBUG=true for more detailed AWS errors"
+          - "3. Try deleting resources manually through the AWS Console"
+          - "4. Inspect resources in the AWS Console to identify dependencies"
+      when: >
+        (verify_vpc.stdout | from_json | length if verify_vpc.stdout else 0) > 0 or
+        (verify_subnet.stdout | from_json | length if verify_subnet.stdout else 0) > 0 or
+        (verify_sg.stdout | from_json | length if verify_sg.stdout else 0) > 0
