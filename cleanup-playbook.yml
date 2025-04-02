@@ -27,6 +27,7 @@
         nat_gateways: []
         vpcs: []
         certificates: []
+        dhcp_option_sets: []
     
     # ENHANCEMENT 1: Identify all AWS resources first before attempting deletion
     # This gives us a complete picture of the environment
@@ -259,7 +260,29 @@
         var: internet_gateways
         verbosity: 1
     
-    # Step 11: Find and catalog certificates
+    # Step 11: Find and catalog DHCP option sets
+    - name: Find DHCP option sets
+      command: >
+        aws ec2 describe-dhcp-options
+        --region {{ aws_region }}
+        --filters "Name=tag:Name,Values={{ resource_prefix }}*"
+        --query 'DhcpOptions[].DhcpOptionsId'
+        --output json
+      register: dhcp_options_output
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse DHCP options output
+      set_fact:
+        dhcp_option_sets: "{{ dhcp_options_output.stdout | from_json }}"
+      when: dhcp_options_output.stdout | length > 0
+    
+    - name: Debug - Show discovered DHCP option sets
+      debug:
+        var: dhcp_option_sets
+        verbosity: 1
+    
+    # Step 12: Find and catalog certificates
     - name: Find certificates with specific tag
       command: >
         aws acm list-certificates 
@@ -517,7 +540,23 @@
         var: delete_vpc
       when: delete_vpc is defined and delete_vpc.results is defined
     
-    # Step 11: Delete certificates
+    # Step 11: Delete DHCP option sets
+    - name: Delete DHCP option sets
+      command: >
+        aws ec2 delete-dhcp-options
+        --region {{ aws_region }}
+        --dhcp-options-id {{ item }}
+      loop: "{{ dhcp_option_sets }}"
+      when: dhcp_option_sets | length > 0
+      register: delete_dhcp
+      failed_when: false
+    
+    - name: Debug DHCP option set deletion
+      debug:
+        var: delete_dhcp
+      when: delete_dhcp is defined and delete_dhcp.results is defined
+    
+    # Step 12: Delete certificates
     - name: Delete certificates
       command: >
         aws acm delete-certificate
@@ -586,6 +625,17 @@
       changed_when: false
       failed_when: false
     
+    - name: Verify DHCP option sets have been deleted
+      command: >
+        aws ec2 describe-dhcp-options
+        --region {{ aws_region }}
+        --filters "Name=tag:Name,Values={{ resource_prefix }}*"
+        --query 'DhcpOptions[].DhcpOptionsId'
+        --output json
+      register: verify_dhcp
+      changed_when: false
+      failed_when: false
+    
     - name: Verify security groups have been deleted
       command: >
         aws ec2 describe-security-groups
@@ -612,6 +662,7 @@
           - "Subnets removed: {{ subnets | length }}"
           - "Internet Gateways removed: {{ internet_gateways | length }}"
           - "VPCs removed: {{ vpcs | length }}"
+          - "DHCP Option Sets removed: {{ dhcp_option_sets | length }}"
           - "Certificates deleted: {{ certificates | length }}"
           - "Local PEM files deleted: {{ pem_files.files | default([]) | length }}"
           - "===================================="
@@ -623,6 +674,7 @@
           - "VPCs remaining: {{ verify_vpc.stdout | from_json | length if verify_vpc.stdout else 0 }}"
           - "Subnets remaining: {{ verify_subnet.stdout | from_json | length if verify_subnet.stdout else 0 }}"
           - "Security Groups remaining: {{ verify_sg.stdout | from_json | length if verify_sg.stdout else 0 }}"
+          - "DHCP Option Sets remaining: {{ verify_dhcp.stdout | from_json | length if verify_dhcp.stdout else 0 }}"
           - "========================================="
       when: verify_vpc is defined and verify_subnet is defined and verify_sg is defined
     
@@ -637,4 +689,5 @@
       when: >
         (verify_vpc.stdout | from_json | length if verify_vpc.stdout else 0) > 0 or
         (verify_subnet.stdout | from_json | length if verify_subnet.stdout else 0) > 0 or
-        (verify_sg.stdout | from_json | length if verify_sg.stdout else 0) > 0
+        (verify_sg.stdout | from_json | length if verify_sg.stdout else 0) > 0 or
+        (verify_dhcp.stdout | from_json | length if verify_dhcp.stdout else 0) > 0
